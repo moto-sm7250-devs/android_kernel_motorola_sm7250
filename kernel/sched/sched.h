@@ -87,13 +87,9 @@
 struct rq;
 struct cpuidle_state;
 
-#define CPU_NR		8
-
-#define TASK_BITS (PID_MAX_DEFAULT + BITS_PER_LONG)
-
 extern __read_mostly bool sched_predl;
-extern unsigned int sched_capacity_margin_up[CPU_NR];
-extern unsigned int sched_capacity_margin_down[CPU_NR];
+extern unsigned int sched_capacity_margin_up[NR_CPUS];
+extern unsigned int sched_capacity_margin_down[NR_CPUS];
 
 struct sched_walt_cpu_load {
 	unsigned long nl;
@@ -279,6 +275,8 @@ static inline int task_has_dl_policy(struct task_struct *p)
  */
 #define SCHED_FLAG_SUGOV	0x10000000
 
+#define SCHED_DL_FLAGS (SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN | SCHED_FLAG_SUGOV)
+
 static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
 {
 #ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
@@ -317,30 +315,6 @@ struct rt_bandwidth {
 
 void __dl_clear_params(struct task_struct *p);
 
-/*
- * To keep the bandwidth of -deadline tasks and groups under control
- * we need some place where:
- *  - store the maximum -deadline bandwidth of the system (the group);
- *  - cache the fraction of that bandwidth that is currently allocated.
- *
- * This is all done in the data structure below. It is similar to the
- * one used for RT-throttling (rt_bandwidth), with the main difference
- * that, since here we are only interested in admission control, we
- * do not decrease any runtime while the group "executes", neither we
- * need a timer to replenish it.
- *
- * With respect to SMP, the bandwidth is given on a per-CPU basis,
- * meaning that:
- *  - dl_bw (< 100%) is the bandwidth of the system (group) on each CPU;
- *  - dl_total_bw array contains, in the i-eth element, the currently
- *    allocated bandwidth on the i-eth CPU.
- * Moreover, groups consume bandwidth on each CPU, while tasks only
- * consume bandwidth on the CPU they're running on.
- * Finally, dl_total_bw_cpu is used to cache the index of dl_total_bw
- * that will be shown the next time the proc or cgroup controls will
- * be red. It on its turn can be changed by writing on its own
- * control.
- */
 struct dl_bandwidth {
 	raw_spinlock_t		dl_runtime_lock;
 	u64			dl_runtime;
@@ -352,6 +326,24 @@ static inline int dl_bandwidth_enabled(void)
 	return sysctl_sched_rt_runtime >= 0;
 }
 
+/*
+ * To keep the bandwidth of -deadline tasks under control
+ * we need some place where:
+ *  - store the maximum -deadline bandwidth of each cpu;
+ *  - cache the fraction of bandwidth that is currently allocated in
+ *    each root domain;
+ *
+ * This is all done in the data structure below. It is similar to the
+ * one used for RT-throttling (rt_bandwidth), with the main difference
+ * that, since here we are only interested in admission control, we
+ * do not decrease any runtime while the group "executes", neither we
+ * need a timer to replenish it.
+ *
+ * With respect to SMP, bandwidth is given on a per root domain basis,
+ * meaning that:
+ *  - bw (< 100%) is the deadline bandwidth of each CPU;
+ *  - total_bw is the currently allocated bandwidth in each root domain;
+ */
 struct dl_bw {
 	raw_spinlock_t		lock;
 	u64			bw;
@@ -648,8 +640,8 @@ struct cfs_rq {
 	s64			runtime_remaining;
 
 	u64			throttled_clock;
-	u64			throttled_clock_task;
-	u64			throttled_clock_task_time;
+	u64			throttled_clock_pelt;
+	u64			throttled_clock_pelt_time;
 	int			throttled;
 	int			throttle_count;
 	struct list_head	throttled_list;
@@ -830,8 +822,6 @@ struct root_domain {
 	 */
 	int			overload;
 
-	int			overutilized;
-
 	/*
 	 * The bit corresponding to a CPU gets set here if such CPU has more
 	 * than one runnable -deadline task (as it is below for RT tasks).
@@ -931,6 +921,8 @@ struct uclamp_rq {
 	unsigned int value;
 	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
 };
+
+DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
 #endif /* CONFIG_UCLAMP_TASK */
 
 /*
@@ -1027,9 +1019,7 @@ struct rq {
 	/* For active balancing */
 	int			active_balance;
 	int			push_cpu;
-#ifdef CONFIG_SCHED_WALT
 	struct task_struct	*push_task;
-#endif
 	struct cpu_stop_work	active_balance_work;
 
 	/* CPU of this runqueue: */
@@ -2207,13 +2197,7 @@ static inline unsigned long task_util(struct task_struct *p)
  *
  * Return: the (estimated) utilization for the specified CPU
  */
-
-#ifdef CONFIG_SCHED_WALT
 static inline unsigned long cpu_util(int cpu)
-#else
-static inline unsigned long cpu_util(int cpu);
-static inline unsigned long __cpu_util(int cpu)
-#endif
 {
 	struct cfs_rq *cfs_rq;
 	unsigned int util;
@@ -2619,18 +2603,48 @@ static inline void cpufreq_update_util(struct rq *rq, unsigned int flags) {}
 #ifdef CONFIG_UCLAMP_TASK
 unsigned long uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id);
 
+/**
+ * uclamp_rq_util_with - clamp @util with @rq and @p effective uclamp values.
+ * @rq:		The rq to clamp against. Must not be NULL.
+ * @util:	The util value to clamp.
+ * @p:		The task to clamp against. Can be NULL if you want to clamp
+ *		against @rq only.
+ *
+ * Clamps the passed @util to the max(@rq, @p) effective uclamp values.
+ *
+ * If sched_uclamp_used static key is disabled, then just return the util
+ * without any clamping since uclamp aggregation at the rq level in the fast
+ * path is disabled, rendering this operation a NOP.
+ *
+ * Use uclamp_eff_value() if you don't care about uclamp values at rq level. It
+ * will return the correct effective uclamp value of the task even if the
+ * static key is disabled.
+ */
 static __always_inline
 unsigned long uclamp_rq_util_with(struct rq *rq, unsigned long util,
 				  struct task_struct *p)
 {
-	unsigned long min_util = READ_ONCE(rq->uclamp[UCLAMP_MIN].value);
-	unsigned long max_util = READ_ONCE(rq->uclamp[UCLAMP_MAX].value);
+	unsigned long min_util = 0;
+	unsigned long max_util = 0;
+
+	if (!static_branch_likely(&sched_uclamp_used))
+		return util;
 
 	if (p) {
-		min_util = max(min_util, uclamp_eff_value(p, UCLAMP_MIN));
-		max_util = max(max_util, uclamp_eff_value(p, UCLAMP_MAX));
+		min_util = uclamp_eff_value(p, UCLAMP_MIN);
+		max_util = uclamp_eff_value(p, UCLAMP_MAX);
+
+		/*
+		 * Ignore last runnable task's max clamp, as this task will
+		 * reset it. Similarly, no need to read the rq's min clamp.
+		 */
+		if (rq->uclamp_flags & UCLAMP_FLAG_IDLE)
+			goto out;
 	}
 
+	min_util = max_t(unsigned long, min_util, READ_ONCE(rq->uclamp[UCLAMP_MIN].value));
+	max_util = max_t(unsigned long, max_util, READ_ONCE(rq->uclamp[UCLAMP_MAX].value));
+out:
 	/*
 	 * Since CPU's {min,max}_util clamps are MAX aggregated considering
 	 * RUNNABLE tasks with _different_ clamps, we can end up with an
@@ -2641,12 +2655,30 @@ unsigned long uclamp_rq_util_with(struct rq *rq, unsigned long util,
 
 	return clamp(util, min_util, max_util);
 }
+
+/*
+ * When uclamp is compiled in, the aggregation at rq level is 'turned off'
+ * by default in the fast path and only gets turned on once userspace performs
+ * an operation that requires it.
+ *
+ * Returns true if userspace opted-in to use uclamp and aggregation at rq level
+ * hence is active.
+ */
+static inline bool uclamp_is_used(void)
+{
+	return static_branch_likely(&sched_uclamp_used);
+}
 #else /* CONFIG_UCLAMP_TASK */
 static inline
 unsigned long uclamp_rq_util_with(struct rq *rq, unsigned long util,
 				  struct task_struct *p)
 {
 	return util;
+}
+
+static inline bool uclamp_is_used(void)
+{
+	return false;
 }
 #endif /* CONFIG_UCLAMP_TASK */
 
@@ -2720,22 +2752,7 @@ static inline unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 {
 	return 0;
 }
-
-static inline unsigned long cpu_util_rt(struct rq *rq)
-{
-	return 0;
-}
 #endif /* CONFIG_CPU_FREQ_GOV_SCHEDUTIL */
-
-#ifdef CONFIG_SMP
-#ifndef CONFIG_SCHED_WALT
-static inline unsigned long cpu_util(int cpu)
-{
-	return min(__cpu_util(cpu) + cpu_util_rt(cpu_rq(cpu)),
-		   capacity_orig_of(cpu));
-}
-#endif
-#endif
 
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 static inline unsigned long cpu_util_irq(struct rq *rq)
@@ -3149,18 +3166,19 @@ task_in_cum_window_demand(struct rq *rq, struct task_struct *p)
 }
 
 static inline bool hmp_capable(void) { return false; }
-static inline bool is_min_capacity_cpu(int cpu)
-{
-#ifdef CONFIG_SMP
-	int min_cpu = cpu_rq(cpu)->rd->min_cap_orig_cpu;
+static inline bool is_max_capacity_cpu(int cpu) { return true; }
+static inline bool is_min_capacity_cpu(int cpu) { return true; }
 
-	return unlikely(min_cpu == -1) ||
-		capacity_orig_of(cpu) == capacity_orig_of(min_cpu);
-#else
-	return true;
-#endif
+static inline int
+preferred_cluster(struct sched_cluster *cluster, struct task_struct *p)
+{
+	return -1;
 }
 
+static inline struct sched_cluster *rq_cluster(struct rq *rq)
+{
+	return NULL;
+}
 
 static inline bool is_asym_cap_cpu(int cpu) { return false; }
 
@@ -3200,6 +3218,11 @@ static inline int update_preferred_cluster(struct related_thread_group *grp,
 
 static inline void add_new_task_to_grp(struct task_struct *new) {}
 
+static inline int same_freq_domain(int src_cpu, int dst_cpu)
+{
+	return 1;
+}
+
 static inline int mark_reserved(int cpu)
 {
 	return 0;
@@ -3214,7 +3237,7 @@ static inline void walt_fixup_cum_window_demand(struct rq *rq,
 #ifdef CONFIG_SMP
 static inline unsigned long thermal_cap(int cpu)
 {
-	return SCHED_CAPACITY_SCALE;
+	return cpu_rq(cpu)->cpu_capacity_orig;
 }
 #endif
 
@@ -3238,6 +3261,13 @@ static inline bool early_detection_notify(struct rq *rq, u64 wallclock)
 {
 	return 0;
 }
+
+#ifdef CONFIG_SMP
+static inline unsigned int power_cost(int cpu, u64 demand)
+{
+	return SCHED_CAPACITY_SCALE;
+}
+#endif
 
 static inline void note_task_waking(struct task_struct *p, u64 wallclock) { }
 static inline bool walt_want_remote_wakeup(void)
